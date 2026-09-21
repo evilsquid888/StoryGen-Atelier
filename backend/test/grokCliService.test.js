@@ -60,7 +60,7 @@ test('generateImage uses image_gen, then image_edit with a reference, and reads 
   });
   assert.equal(uri, 'data:image/png;base64,iVBORw0KGgo=');
   assert.equal(call[call.indexOf('--tools') + 1], 'image_gen');
-  assert.ok(call.includes('--always-approve') && call.includes('--json-schema'));
+  assert.ok(call.includes('--always-approve') && !call.includes('--json-schema'));
   assert.match(call[call.indexOf('-p') + 1], /a fox on a hill/);
   assert.match(call[call.indexOf('-p') + 1], /aspect_ratio="16:9"/);
 
@@ -99,8 +99,43 @@ test('generateVideo pins first/last frames or animates a single image', async ()
   assert.equal(call[call.indexOf('--tools') + 1], 'image_to_video');
   assert.match(call[call.indexOf('-p') + 1], /duration=15/);
 
+  let attempts = 0;
   await assert.rejects(
-    cli.generateVideo({ prompt: 'x', firstFrame: frame, durationSeconds: 4 }, { env, execImpl: async () => ok({ text: 'done, no file' }) }),
+    cli.generateVideo({ prompt: 'x', firstFrame: frame, durationSeconds: 4 }, { env, execImpl: async () => { attempts += 1; return ok({ text: 'done, no file' }); } }),
     /did not report a saved file/
   );
+  assert.equal(attempts, 2, 'retries once when the agent skipped the tool');
+});
+
+test('resolves session-relative or misreported paths against the Grok session folder', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-home-'));
+  const sessionId = '01a0c494-199f-72c3-80f6-c9d577191d08';
+  const session = path.join(home, 'sessions', encodeURIComponent(workDir), sessionId);
+  fs.mkdirSync(path.join(session, 'images'), { recursive: true });
+  fs.mkdirSync(path.join(session, 'videos'), { recursive: true });
+  const img = path.join(session, 'images', '1.jpg');
+  fs.writeFileSync(img, Buffer.from('/9j/', 'base64'));
+  const vid = path.join(session, 'videos', '1.mp4');
+  fs.writeFileSync(vid, 'mp4');
+  const envHome = { ...env, GROK_CLI_HOME: home };
+
+  // Model guessed a cwd-relative path that does not exist.
+  const uri = await cli.generateImage({ prompt: 'x' }, {
+    env: envHome,
+    execImpl: async () => ok({ sessionId, text: `{"path": "${path.join(workDir, 'images', '1.jpg')}"}` }),
+  });
+  assert.equal(uri, `data:image/jpeg;base64,${fs.readFileSync(img).toString('base64')}`);
+
+  // Model reported only the short session-relative form.
+  const uri2 = await cli.generateImage({ prompt: 'x' }, {
+    env: envHome, execImpl: async () => ok({ sessionId, text: 'Saved to images/1.jpg' }),
+  });
+  assert.equal(uri2, uri);
+
+  // Model reported nothing usable: fall back to the newest video in the session.
+  const frame = { bytesBase64Encoded: 'iVBORw0KGgo=', mimeType: 'image/png' };
+  const file = await cli.generateVideo({ prompt: 'x', firstFrame: frame, durationSeconds: 4 }, {
+    env: envHome, execImpl: async () => ok({ sessionId, text: 'Done.' }),
+  });
+  assert.equal(file, vid);
 });

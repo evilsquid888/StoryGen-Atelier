@@ -3,8 +3,10 @@
 // Grok Build session (SuperGrok / X Premium+) instead of a raw API key.
 //
 //   text  : `grok --prompt-json <ACP blocks> --output-format json`
-//   image : `grok -p "<instruction>" --tools image_gen,image_edit --json-schema {path}`
-//   video : `grok -p "<instruction>" --tools image_to_video,reference_to_video --json-schema {path}`
+//   image : `grok -p "<instruction>" --tools image_gen,image_edit`
+//   video : `grok -p "<instruction>" --tools image_to_video,reference_to_video`
+// (No --json-schema: structured output constrains the first reply to JSON,
+// which stops the agent from calling the tool at all.)
 //
 // Every call is a fresh headless session with --always-approve, a tool
 // allowlist, and a bounded --max-turns, so the agent can only do the one
@@ -18,11 +20,6 @@ const { log } = require('../utils/logger');
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_WORKDIR = path.join(__dirname, '../../data/grok-cli');
-const PATH_SCHEMA = JSON.stringify({
-  type: 'object',
-  properties: { path: { type: 'string', description: 'Absolute path of the saved file' } },
-  required: ['path'],
-});
 
 const clean = (value) => (value || '').trim();
 
@@ -146,7 +143,32 @@ const dataUriToFrame = (dataUri) => {
   return { mimeType: match[1], bytesBase64Encoded: match[2] };
 };
 
-const extractPath = (result, extensions) => {
+// Grok Build writes tool output under its own session folder:
+//   ~/.grok/sessions/<encodeURIComponent(cwd)>/<sessionId>/{images,videos}/N.ext
+// The model usually reports that absolute path, but sometimes echoes the
+// session-relative form ("images/1.jpg") or guesses it lives under cwd, so
+// resolve every candidate against the session folder and, failing that, take
+// the newest matching file the session produced.
+const grokHome = (env) => clean(env.GROK_CLI_HOME) || path.join(os.homedir(), '.grok');
+
+const sessionDir = (result, env) => {
+  const { workDir } = getConfig(env);
+  if (!result?.sessionId) return null;
+  return path.join(grokHome(env), 'sessions', encodeURIComponent(workDir), String(result.sessionId));
+};
+
+const newestFile = (dir, extensions) => {
+  if (!dir || !fs.existsSync(dir)) return null;
+  const exts = new Set(extensions.map((e) => `.${e.toLowerCase()}`));
+  const files = fs.readdirSync(dir)
+    .filter((f) => exts.has(path.extname(f).toLowerCase()))
+    .map((f) => path.join(dir, f))
+    .map((f) => ({ f, mtime: fs.statSync(f).mtimeMs }))
+    .sort((a, b) => b.mtime - a.mtime);
+  return files.length ? files[0].f : null;
+};
+
+const extractPath = (result, extensions, env = process.env) => {
   const structured = result.structuredOutput || result.structured_output;
   const candidates = [];
   if (structured && typeof structured.path === 'string') candidates.push(structured.path);
@@ -155,12 +177,30 @@ const extractPath = (result, extensions) => {
     const parsed = JSON.parse(text);
     if (parsed && typeof parsed.path === 'string') candidates.push(parsed.path);
   } catch (_) { /* not JSON */ }
-  const re = new RegExp(`(/[^\\s"'\`]+\\.(?:${extensions.join('|')}))`, 'i');
+  const re = new RegExp(`((?:/|\\b(?:images|videos)/)[^\\s"'\`]*\\.(?:${extensions.join('|')}))`, 'i');
   const m = re.exec(text);
   if (m) candidates.push(m[1]);
-  const found = candidates.find((p) => p && fs.existsSync(p));
-  if (!found) throw new Error(`Grok CLI did not report a saved file. Response: ${text.slice(0, 200)}`);
-  return found;
+
+  const session = sessionDir(result, env);
+  const resolved = [];
+  for (const candidate of candidates) {
+    resolved.push(candidate);
+    if (session) {
+      // "images/1.jpg" or ".../<anything>/images/1.jpg" -> <session>/images/1.jpg
+      const rel = /(?:^|[\\/])((?:images|videos)[\\/][^\\/]+)$/.exec(candidate);
+      if (rel) resolved.push(path.join(session, rel[1]));
+    }
+  }
+  const found = resolved.find((p) => p && fs.existsSync(p) && fs.statSync(p).isFile());
+  if (found) return found;
+
+  const kind = extensions.includes('mp4') ? 'videos' : 'images';
+  const newest = session ? newestFile(path.join(session, kind), extensions) : null;
+  if (newest) {
+    log('grok_cli_path_fallback', { reported: candidates[0] || null, used: newest });
+    return newest;
+  }
+  throw new Error(`Grok CLI did not report a saved file. Response: ${text.slice(0, 200)}`);
 };
 
 const fileToDataUri = (file) => {
@@ -181,12 +221,25 @@ const buildImageInstruction = ({ prompt, referencePath, aspectRatio }) => {
     '<<<PROMPT',
     prompt,
     'PROMPT>>>',
-    'When the tool returns, respond with ONLY a JSON object {"path": "<absolute path of the saved image>"}.',
+    'You MUST actually invoke the tool; never answer without a tool result.',
+    'When the tool returns, reply with a single line containing only the absolute path of the saved image, exactly as the tool reported it.',
   ].join('\n');
 };
 
+// The agent occasionally answers without invoking the tool. Retry once when
+// no file was produced; a real API failure surfaces on the first attempt.
+const withOneRetry = async (label, fn) => {
+  try {
+    return await fn();
+  } catch (error) {
+    if (!/did not report a saved file/.test(error.message)) throw error;
+    log('grok_cli_retry', { label, reason: error.message.slice(0, 160) });
+    return await fn();
+  }
+};
+
 // Returns a data URI of the generated frame.
-const generateImage = async ({ prompt, referenceImage = null }, options = {}) => {
+const generateImage = async ({ prompt, referenceImage = null }, options = {}) => withOneRetry('image', async () => {
   const env = options.env || process.env;
   const cfg = getConfig(env);
   fs.mkdirSync(cfg.workDir, { recursive: true });
@@ -202,13 +255,12 @@ const generateImage = async ({ prompt, referenceImage = null }, options = {}) =>
   const result = await runGrok([
     '-p', buildImageInstruction({ prompt, referencePath, aspectRatio: cfg.imageAspectRatio }),
     '--tools', referencePath ? 'image_gen,image_edit' : 'image_gen',
-    '--json-schema', PATH_SCHEMA,
     '--always-approve', '--no-plan', '--no-subagents', '--max-turns', '4',
   ], options);
 
-  const file = extractPath(result, ['png', 'jpg', 'jpeg', 'webp']);
+  const file = extractPath(result, ['png', 'jpg', 'jpeg', 'webp'], env);
   return fileToDataUri(file);
-};
+});
 
 // ---------- video ----------
 
@@ -223,12 +275,13 @@ const buildVideoInstruction = ({ prompt, firstPath, lastPath, duration, aspectRa
     '<<<PROMPT',
     prompt,
     'PROMPT>>>',
-    'When the tool returns, respond with ONLY a JSON object {"path": "<absolute path of the saved video>"}.',
+    'You MUST actually invoke the tool; never answer without a tool result.',
+    'When the tool returns, reply with a single line containing only the absolute path of the saved video, exactly as the tool reported it.',
   ].join('\n');
 };
 
 // Returns the absolute path of the generated .mp4 (inside the CLI work dir).
-const generateVideo = async ({ prompt, firstFrame, lastFrame = null, durationSeconds }, options = {}) => {
+const generateVideo = async ({ prompt, firstFrame, lastFrame = null, durationSeconds }, options = {}) => withOneRetry('video', async () => {
   const env = options.env || process.env;
   const cfg = getConfig(env);
   if (!firstFrame) throw new Error('A first frame is required for Grok CLI video generation');
@@ -245,12 +298,11 @@ const generateVideo = async ({ prompt, firstFrame, lastFrame = null, durationSec
       aspectRatio: cfg.videoAspectRatio, resolution: cfg.videoResolution,
     }),
     '--tools', lastPath ? 'reference_to_video' : 'image_to_video',
-    '--json-schema', PATH_SCHEMA,
     '--always-approve', '--no-plan', '--no-subagents', '--max-turns', '4',
   ], options);
 
-  return extractPath(result, ['mp4', 'mov', 'webm']);
-};
+  return extractPath(result, ['mp4', 'mov', 'webm'], env);
+});
 
 module.exports = {
   getConfig,
@@ -263,5 +315,5 @@ module.exports = {
   generateVideo,
   buildImageInstruction,
   buildVideoInstruction,
-  _internal: { parseHeadlessOutput, extractPath, tmpdir: os.tmpdir },
+  _internal: { parseHeadlessOutput, extractPath, sessionDir },
 };
