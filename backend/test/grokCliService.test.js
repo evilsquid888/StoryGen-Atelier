@@ -16,22 +16,62 @@ test('detects the binary from GROK_CLI_BIN or PATH', () => {
   assert.equal(cli.isAvailable({ GROK_CLI_BIN: 'grok', PATH: '/nonexistent-dir' }), false);
 });
 
-test('generateText sends ACP content blocks and returns the text field', async () => {
-  let call;
+test('generateText writes the prompt and images to files and returns the answer', async () => {
+  let call; let promptText; let imageExisted;
   const text = await cli.generateText(
-    [{ text: 'Return JSON.' }, { inlineData: { mimeType: 'image/png', data: 'aW1n' } }],
-    { env, execImpl: async (bin, args) => { call = { bin, args }; return ok({ text: ' [] ', stopReason: 'end_turn' }); } }
+    [{ text: 'Return JSON.' }, { inlineData: { mimeType: 'image/png', data: 'iVBORw0KGgo=' } }],
+    {
+      env,
+      execImpl: async (bin, args) => {
+        call = { bin, args };
+        const promptFile = args[args.indexOf('--prompt-file') + 1];
+        promptText = fs.readFileSync(promptFile, 'utf8');
+        const imgPath = /\[Attached image file: ([^\]]+)\]/.exec(promptText)[1];
+        imageExisted = fs.existsSync(imgPath);
+        return ok({ text: 'I will read the frame first. [{"shot":1}]', stopReason: 'end_turn' });
+      },
+    }
   );
-  assert.equal(text, '[]');
+  assert.equal(text, '[{"shot":1}]', 'narration before the JSON is stripped');
   assert.equal(call.bin, process.execPath);
-  const i = call.args.indexOf('--prompt-json');
-  assert.deepEqual(JSON.parse(call.args[i + 1]), [
-    { type: 'text', text: 'Return JSON.' },
-    { type: 'image', data: 'aW1n', mimeType: 'image/png' },
-  ]);
+  assert.ok(!call.args.includes('--prompt-json'), 'no base64 in argv (E2BIG)');
+  assert.match(promptText, /read EVERY one of them with the read_file tool/);
+  assert.match(promptText, /Return JSON\./);
+  assert.equal(imageExisted, true, 'image file present during the call');
+  assert.equal(call.args[call.args.indexOf('--max-turns') + 1], '4');
+  assert.equal(call.args[call.args.indexOf('--tools') + 1], 'read_file');
   assert.ok(call.args.includes('--output-format') && call.args.includes('json'));
-  assert.ok(call.args.includes('--no-auto-update'));
   assert.equal(call.args[call.args.indexOf('--cwd') + 1], workDir);
+  assert.equal(fs.readdirSync(path.join(workDir, 'inputs')).length, 0, 'prompt and image files cleaned up');
+
+  // Text-only prompts stay single-turn and pass through untouched.
+  const plain = await cli.generateText([{ text: 'hi' }], {
+    env, execImpl: async (_b, args) => { call = { args }; return ok({ text: ' plain answer ' }); },
+  });
+  assert.equal(plain, 'plain answer');
+  assert.equal(call.args[call.args.indexOf('--max-turns') + 1], '1');
+});
+
+test('sniffs the real image type of reference frames', () => {
+  const { sniffMime } = cli._internal;
+  assert.equal(sniffMime(Buffer.from([0xff, 0xd8, 0xff, 0xe0])), 'image/jpeg');
+  assert.equal(sniffMime(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0])), 'image/png');
+  assert.equal(sniffMime(Buffer.from('RIFF....WEBPVP8 ')), 'image/webp');
+  assert.equal(sniffMime(Buffer.from('nope')), null);
+});
+
+test('caps concurrent CLI processes', async () => {
+  let running = 0; let peak = 0;
+  const slow = async () => {
+    running += 1; peak = Math.max(peak, running);
+    await new Promise((r) => setTimeout(r, 20));
+    running -= 1;
+    return ok({ text: 'x' });
+  };
+  await Promise.all(Array.from({ length: 6 }, () => cli.generateText([{ text: 'hi' }], {
+    env: { ...env, GROK_CLI_MAX_PARALLEL: '2' }, execImpl: slow,
+  })));
+  assert.equal(peak, 2);
 });
 
 test('surfaces CLI error events and non-zero exits', async () => {
@@ -71,7 +111,8 @@ test('generateImage uses image_gen, then image_edit with a reference, and reads 
   assert.equal(call[call.indexOf('--tools') + 1], 'image_gen,image_edit');
   const instruction = call[call.indexOf('-p') + 1];
   const refMatch = /image="([^"]+)"/.exec(instruction);
-  assert.ok(refMatch && fs.existsSync(refMatch[1]), 'reference frame written to disk');
+  assert.ok(refMatch && refMatch[1].endsWith('.png'), 'reference frame passed by path');
+  assert.equal(fs.existsSync(refMatch[1]), false, 'reference frame cleaned up after the call');
 });
 
 test('generateVideo pins first/last frames or animates a single image', async () => {
@@ -138,4 +179,23 @@ test('resolves session-relative or misreported paths against the Grok session fo
     env: envHome, execImpl: async () => ok({ sessionId, text: 'Done.' }),
   });
   assert.equal(file, vid);
+
+  // Model echoed our own input path: never return the reference frame as output.
+  let echoed;
+  await assert.rejects(
+    cli.generateImage({ prompt: 'x', referenceImage: 'data:image/png;base64,iVBORw0KGgo=' }, {
+      env, execImpl: async (_b, args) => {
+        echoed = /image="([^"]+)"/.exec(args[args.indexOf('-p') + 1])[1];
+        return ok({ text: `Edited ${echoed}` });
+      },
+    }),
+    /did not report a saved file/
+  );
+});
+
+test('reports spawn failures and timeouts with their cause', async () => {
+  await assert.rejects(
+    cli.generateText([{ text: 'x' }], { env, execImpl: async () => ({ code: 1, stdout: '', stderr: '', failure: 'killed by SIGTERM after 5 ms' }) }),
+    /failed to run: killed by SIGTERM/
+  );
 });

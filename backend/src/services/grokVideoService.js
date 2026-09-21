@@ -29,31 +29,17 @@ const buildRequestBody = ({ prompt, firstFrame, lastFrame, durationSeconds }, en
   if (!text) throw new Error('A prompt is required for Grok video generation');
 
   const { videoModel } = grokClient.getConfig(env);
-  const body = {
+  const first = toDataUri(firstFrame);
+  const last = toDataUri(lastFrame);
+  return {
     model: videoModel,
     prompt: text,
+    ...(first ? { image: { url: first } } : {}),
+    ...(last ? { last_frame: { url: last } } : {}),
     duration: normalizeDuration(durationSeconds),
     aspect_ratio: (env.XAI_VIDEO_ASPECT_RATIO || '').trim() || '16:9',
     resolution: (env.XAI_VIDEO_RESOLUTION || '').trim() || DEFAULT_RESOLUTION,
     generate_audio: (env.XAI_VIDEO_GENERATE_AUDIO || '').trim().toLowerCase() !== 'false',
-  };
-
-  const first = toDataUri(firstFrame);
-  const last = toDataUri(lastFrame);
-  if (first) body.image = { url: first };
-  if (last) body.last_frame = { url: last };
-
-  // Field order matters only for readability of logs; keep the model/prompt
-  // first and media before output settings.
-  return {
-    model: body.model,
-    prompt: body.prompt,
-    ...(body.image ? { image: body.image } : {}),
-    ...(body.last_frame ? { last_frame: body.last_frame } : {}),
-    duration: body.duration,
-    aspect_ratio: body.aspect_ratio,
-    resolution: body.resolution,
-    generate_audio: body.generate_audio,
   };
 };
 

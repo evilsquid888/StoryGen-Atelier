@@ -2,7 +2,9 @@
 // headless mode so text, image, and video generation run through the user's
 // Grok Build session (SuperGrok / X Premium+) instead of a raw API key.
 //
-//   text  : `grok --prompt-json <ACP blocks> --output-format json`
+//   text  : `grok --prompt-file <prompt.txt> --tools read_file` (images are
+//           written to disk and the agent reads them; inline base64 in argv
+//           trips the 128 KB per-argument limit, spawn E2BIG)
 //   image : `grok -p "<instruction>" --tools image_gen,image_edit`
 //   video : `grok -p "<instruction>" --tools image_to_video,reference_to_video`
 // (No --json-schema: structured output constrains the first reply to JSON,
@@ -26,22 +28,42 @@ const clean = (value) => (value || '').trim();
 const getConfig = (env = process.env) => ({
   binary: clean(env.GROK_CLI_BIN) || 'grok',
   model: clean(env.GROK_CLI_MODEL),
-  workDir: clean(env.GROK_CLI_WORKDIR) || DEFAULT_WORKDIR,
+  workDir: path.resolve(clean(env.GROK_CLI_WORKDIR) || DEFAULT_WORKDIR),
   timeoutMs: Number.parseInt(env.GROK_CLI_TIMEOUT_MS, 10) || DEFAULT_TIMEOUT_MS,
   imageAspectRatio: clean(env.GROK_CLI_IMAGE_ASPECT_RATIO) || '16:9',
   videoResolution: clean(env.GROK_CLI_VIDEO_RESOLUTION) || '720p',
   videoAspectRatio: clean(env.GROK_CLI_VIDEO_ASPECT_RATIO) || '16:9',
+  maxParallel: Math.max(1, Number.parseInt(env.GROK_CLI_MAX_PARALLEL, 10) || 4),
 });
 
+// Simple semaphore so a 12-shot storyboard does not spawn 12 grok processes
+// at once (each one is a full agent session hitting the Imagine API).
+let inFlight = 0;
+const waiters = [];
+const acquire = (limit) => new Promise((resolve) => {
+  const tryAcquire = () => {
+    if (inFlight < limit) { inFlight += 1; resolve(); return true; }
+    return false;
+  };
+  if (!tryAcquire()) waiters.push(tryAcquire);
+});
+const release = () => {
+  inFlight -= 1;
+  while (waiters.length && waiters[0]()) waiters.shift();
+};
+
 // Resolve the binary: an explicit GROK_CLI_BIN path, or `grok` on PATH.
+const WINDOWS_EXTS = process.platform === 'win32' ? ['.exe', '.cmd', '.bat', ''] : [''];
 const resolveBinary = (env = process.env) => {
   const { binary } = getConfig(env);
-  if (binary.includes(path.sep)) return fs.existsSync(binary) ? binary : null;
+  if (/[\\/]/.test(binary)) return fs.existsSync(binary) ? binary : null;
   const searchPath = env.PATH || process.env.PATH || '';
   for (const dir of searchPath.split(path.delimiter)) {
     if (!dir) continue;
-    const candidate = path.join(dir, binary);
-    if (fs.existsSync(candidate)) return candidate;
+    for (const ext of WINDOWS_EXTS) {
+      const candidate = path.join(dir, binary + ext);
+      if (fs.existsSync(candidate)) return candidate;
+    }
   }
   return null;
 };
@@ -50,7 +72,16 @@ const isAvailable = (env = process.env) => resolveBinary(env) !== null;
 
 const defaultExec = (bin, args, options) => new Promise((resolve) => {
   execFile(bin, args, options, (error, stdout, stderr) => {
-    resolve({ code: error ? (typeof error.code === 'number' ? error.code : 1) : 0, stdout: String(stdout || ''), stderr: String(stderr || ''), error });
+    let code = 0;
+    let failure = null;
+    if (error) {
+      code = typeof error.code === 'number' ? error.code : 1;
+      // Timeout kills report killed=true with a null code; spawn failures
+      // (ENOENT, E2BIG, EACCES) carry a string code. Keep that context.
+      if (error.killed) failure = `killed by ${error.signal || 'timeout'} after ${options.timeout || 0} ms`;
+      else if (typeof error.code === 'string') failure = `${error.code}: ${error.message}`;
+    }
+    resolve({ code, stdout: String(stdout || ''), stderr: String(stderr || ''), failure });
   });
 });
 
@@ -82,17 +113,24 @@ const runGrok = async (args, options = {}) => {
   if (cfg.model) fullArgs.push('--model', cfg.model);
 
   log('grok_cli_exec', { bin, args: fullArgs.filter((a) => a.length < 120) });
-  const { code, stdout, stderr } = await execImpl(bin, fullArgs, {
-    cwd: cfg.workDir,
-    env: { ...process.env, ...env },
-    timeout: cfg.timeoutMs,
-    maxBuffer: 64 * 1024 * 1024,
-  });
+  await acquire(cfg.maxParallel);
+  let code; let stdout; let stderr; let failure;
+  try {
+    ({ code, stdout, stderr, failure } = await execImpl(bin, fullArgs, {
+      cwd: cfg.workDir,
+      env: { ...process.env, ...env },
+      timeout: cfg.timeoutMs,
+      maxBuffer: 64 * 1024 * 1024,
+    }));
+  } finally {
+    release();
+  }
 
   const parsed = parseHeadlessOutput(stdout);
   if (parsed && parsed.type === 'error') {
     throw new Error(`Grok CLI error: ${parsed.message || 'unknown error'}`);
   }
+  if (failure) throw new Error(`Grok CLI failed to run: ${failure}`);
   if (code !== 0) {
     const detail = (stderr || stdout || '').trim().split('\n').slice(-3).join(' ');
     throw new Error(`Grok CLI exited with code ${code}: ${detail}`);
@@ -111,15 +149,68 @@ const toAcpBlocks = (promptParts) => promptParts.map((part) => {
   throw new Error('Unsupported Grok CLI prompt part');
 });
 
+// The headless `text` field concatenates every assistant message of the run,
+// so a tool-using turn can prepend narration ("I'll read both frames first")
+// to the JSON answer. Return the outermost JSON value when one is embedded.
+const stripToJson = (text) => {
+  const trimmed = String(text || '').trim();
+  try { JSON.parse(trimmed); return trimmed; } catch (_) { /* fall through */ }
+  const cleaned = trimmed.replace(/```json/gi, '').replace(/```/g, '');
+  for (const [open, close] of [['[', ']'], ['{', '}']]) {
+    const start = cleaned.indexOf(open);
+    const end = cleaned.lastIndexOf(close);
+    if (start !== -1 && end > start) {
+      const candidate = cleaned.slice(start, end + 1);
+      try { JSON.parse(candidate); return candidate; } catch (_) { /* try next */ }
+    }
+  }
+  return trimmed;
+};
+
+// Build a plain-text prompt: text parts verbatim, image parts saved to disk
+// and referenced by path for the agent's read_file tool.
+const buildTextPrompt = (promptParts, workDir) => {
+  const files = [];
+  const body = promptParts.map((part) => {
+    if (typeof part?.text === 'string') return part.text;
+    if (part?.inlineData?.data) {
+      const file = writeFrameFile(workDir, 'prompt', {
+        bytesBase64Encoded: part.inlineData.data, mimeType: part.inlineData.mimeType,
+      });
+      files.push(file);
+      return `[Attached image file: ${file}]`;
+    }
+    throw new Error('Unsupported Grok CLI prompt part');
+  }).join('\n\n');
+
+  const preamble = files.length
+    ? `${files.length} image file(s) are attached below by absolute path. Before answering, read EVERY one of them with the read_file tool so you can see the pictures. Do not narrate what you are doing; after reading, output only the requested answer.\n\n`
+    : 'Output only the requested answer, with no narration.\n\n';
+  return { prompt: preamble + body, files };
+};
+
 const generateText = async (promptParts, options = {}) => {
-  const result = await runGrok([
-    '--prompt-json', JSON.stringify(toAcpBlocks(promptParts)),
-    '--tools', 'read_file',
-    '--no-plan', '--no-subagents', '--max-turns', '1',
-  ], options);
-  const text = typeof result.text === 'string' ? result.text.trim() : '';
-  if (!text) throw new Error('Grok CLI text response was empty');
-  return text;
+  const env = options.env || process.env;
+  const cfg = getConfig(env);
+  fs.mkdirSync(cfg.workDir, { recursive: true });
+  const { prompt, files } = buildTextPrompt(promptParts, cfg.workDir);
+  const promptFile = path.join(cfg.workDir, 'inputs', `prompt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.txt`);
+  fs.mkdirSync(path.dirname(promptFile), { recursive: true });
+  fs.writeFileSync(promptFile, prompt);
+
+  try {
+    const result = await runGrok([
+      '--prompt-file', promptFile,
+      '--tools', 'read_file',
+      '--always-approve', '--no-plan', '--no-subagents',
+      '--max-turns', files.length ? '4' : '1',
+    ], options);
+    const text = typeof result.text === 'string' ? stripToJson(result.text) : '';
+    if (!text) throw new Error('Grok CLI text response was empty');
+    return text;
+  } finally {
+    cleanupFiles([promptFile, ...files]);
+  }
 };
 
 // ---------- shared file helpers ----------
@@ -127,14 +218,34 @@ const generateText = async (promptParts, options = {}) => {
 const MIME_BY_EXT = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif' };
 const EXT_BY_MIME = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp', 'image/gif': '.gif' };
 
+// Callers often pass a bare base64 string with a guessed MIME type (the
+// frontend strips the data-URI header), so trust the magic bytes first.
+const sniffMime = (buffer) => {
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'image/jpeg';
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+  if (buffer.length >= 12 && buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+  if (buffer.length >= 6 && buffer.subarray(0, 6).toString('ascii').startsWith('GIF8')) return 'image/gif';
+  return null;
+};
+
 // Persist a base64 frame so the CLI tools can reference it by absolute path.
 const writeFrameFile = (workDir, label, { bytesBase64Encoded, mimeType }) => {
   const dir = path.join(workDir, 'inputs');
   fs.mkdirSync(dir, { recursive: true });
-  const ext = EXT_BY_MIME[(mimeType || '').split(';')[0]] || '.png';
+  const buffer = Buffer.from(bytesBase64Encoded, 'base64');
+  const mime = sniffMime(buffer) || (mimeType || '').split(';')[0];
+  const ext = EXT_BY_MIME[mime] || '.png';
   const file = path.join(dir, `${label}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
-  fs.writeFileSync(file, Buffer.from(bytesBase64Encoded, 'base64'));
+  fs.writeFileSync(file, buffer);
   return file;
+};
+
+// Input frames are only needed for the duration of one CLI call.
+const cleanupFiles = (files) => {
+  for (const file of files) {
+    if (!file) continue;
+    try { fs.unlinkSync(file); } catch (_) { /* already gone */ }
+  }
 };
 
 const dataUriToFrame = (dataUri) => {
@@ -169,36 +280,34 @@ const newestFile = (dir, extensions) => {
 };
 
 const extractPath = (result, extensions, env = process.env) => {
-  const structured = result.structuredOutput || result.structured_output;
-  const candidates = [];
-  if (structured && typeof structured.path === 'string') candidates.push(structured.path);
+  const { workDir } = getConfig(env);
+  const inputsDir = path.join(workDir, 'inputs');
   const text = typeof result.text === 'string' ? result.text : '';
+  const kind = extensions.includes('mp4') ? 'videos' : 'images';
+
+  // 1. Every call is a fresh headless session, so the file the tool saved is
+  //    simply the newest one in that session's images/ or videos/ folder.
+  const session = sessionDir(result, env);
+  const produced = session ? newestFile(path.join(session, kind), extensions) : null;
+  if (produced) return produced;
+
+  // 2. Fall back to whatever path the model wrote, ignoring our own inputs.
+  const candidates = [];
+  const structured = result.structuredOutput || result.structured_output;
+  if (structured && typeof structured.path === 'string') candidates.push(structured.path);
   try {
     const parsed = JSON.parse(text);
     if (parsed && typeof parsed.path === 'string') candidates.push(parsed.path);
   } catch (_) { /* not JSON */ }
-  const re = new RegExp(`((?:/|\\b(?:images|videos)/)[^\\s"'\`]*\\.(?:${extensions.join('|')}))`, 'i');
-  const m = re.exec(text);
-  if (m) candidates.push(m[1]);
+  const re = new RegExp(`(/[^\\s"'\`]*\\.(?:${extensions.join('|')}))`, 'gi');
+  for (const m of text.matchAll(re)) candidates.push(m[1]);
 
-  const session = sessionDir(result, env);
-  const resolved = [];
-  for (const candidate of candidates) {
-    resolved.push(candidate);
-    if (session) {
-      // "images/1.jpg" or ".../<anything>/images/1.jpg" -> <session>/images/1.jpg
-      const rel = /(?:^|[\\/])((?:images|videos)[\\/][^\\/]+)$/.exec(candidate);
-      if (rel) resolved.push(path.join(session, rel[1]));
-    }
-  }
-  const found = resolved.find((p) => p && fs.existsSync(p) && fs.statSync(p).isFile());
-  if (found) return found;
-
-  const kind = extensions.includes('mp4') ? 'videos' : 'images';
-  const newest = session ? newestFile(path.join(session, kind), extensions) : null;
-  if (newest) {
-    log('grok_cli_path_fallback', { reported: candidates[0] || null, used: newest });
-    return newest;
+  const found = candidates.find((p) => p
+    && !path.resolve(p).startsWith(inputsDir + path.sep)
+    && fs.existsSync(p) && fs.statSync(p).isFile());
+  if (found) {
+    log('grok_cli_path_from_text', { used: found, sessionId: result.sessionId || null });
+    return found;
   }
   throw new Error(`Grok CLI did not report a saved file. Response: ${text.slice(0, 200)}`);
 };
@@ -252,14 +361,18 @@ const generateImage = async ({ prompt, referenceImage = null }, options = {}) =>
     referencePath = writeFrameFile(cfg.workDir, 'ref', frame);
   }
 
-  const result = await runGrok([
-    '-p', buildImageInstruction({ prompt, referencePath, aspectRatio: cfg.imageAspectRatio }),
-    '--tools', referencePath ? 'image_gen,image_edit' : 'image_gen',
-    '--always-approve', '--no-plan', '--no-subagents', '--max-turns', '4',
-  ], options);
+  try {
+    const result = await runGrok([
+      '-p', buildImageInstruction({ prompt, referencePath, aspectRatio: cfg.imageAspectRatio }),
+      '--tools', referencePath ? 'image_gen,image_edit' : 'image_gen',
+      '--always-approve', '--no-plan', '--no-subagents', '--max-turns', '4',
+    ], options);
 
-  const file = extractPath(result, ['png', 'jpg', 'jpeg', 'webp'], env);
-  return fileToDataUri(file);
+    const file = extractPath(result, ['png', 'jpg', 'jpeg', 'webp'], env);
+    return fileToDataUri(file);
+  } finally {
+    cleanupFiles([referencePath]);
+  }
 });
 
 // ---------- video ----------
@@ -292,16 +405,20 @@ const generateVideo = async ({ prompt, firstFrame, lastFrame = null, durationSec
   const parsed = Number.parseInt(durationSeconds, 10);
   const duration = Number.isInteger(parsed) ? Math.min(15, Math.max(1, parsed)) : 6;
 
-  const result = await runGrok([
-    '-p', buildVideoInstruction({
-      prompt, firstPath, lastPath, duration,
-      aspectRatio: cfg.videoAspectRatio, resolution: cfg.videoResolution,
-    }),
-    '--tools', lastPath ? 'reference_to_video' : 'image_to_video',
-    '--always-approve', '--no-plan', '--no-subagents', '--max-turns', '4',
-  ], options);
+  try {
+    const result = await runGrok([
+      '-p', buildVideoInstruction({
+        prompt, firstPath, lastPath, duration,
+        aspectRatio: cfg.videoAspectRatio, resolution: cfg.videoResolution,
+      }),
+      '--tools', lastPath ? 'reference_to_video' : 'image_to_video',
+      '--always-approve', '--no-plan', '--no-subagents', '--max-turns', '4',
+    ], options);
 
-  return extractPath(result, ['mp4', 'mov', 'webm'], env);
+    return extractPath(result, ['mp4', 'mov', 'webm'], env);
+  } finally {
+    cleanupFiles([firstPath, lastPath]);
+  }
 });
 
 module.exports = {
@@ -315,5 +432,5 @@ module.exports = {
   generateVideo,
   buildImageInstruction,
   buildVideoInstruction,
-  _internal: { parseHeadlessOutput, extractPath, sessionDir },
+  _internal: { parseHeadlessOutput, extractPath, sessionDir, stripToJson, sniffMime },
 };
