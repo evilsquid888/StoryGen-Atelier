@@ -1,7 +1,7 @@
 {
   "name": "storygen-backend",
   "version": "1.0.0",
-  "description": "Backend for StoryGenApp",
+  "description": "Backend for StoryGen Atelier (Grok edition)",
   "main": "src/app.js",
   "scripts": {
     "start": "node src/app.js",
@@ -12,8 +12,6 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@google/generative-ai": "^0.24.1",
-    "google-auth-library": "^9.14.1",
     "better-sqlite3": "^12.5.0",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",

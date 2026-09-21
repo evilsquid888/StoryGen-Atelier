@@ -18,9 +18,7 @@ exports.generateStoryboard = async (req, res) => {
     sentence,
     requestedShots,
     style,
-    model: llmService.getConfiguredTextModel(
-      process.env.GEMINI_TEXT_MODEL || "gemini-3-pro-preview"
-    ),
+    model: llmService.getConfiguredTextModel(),
   });
 
   try {
