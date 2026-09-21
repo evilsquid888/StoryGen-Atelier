@@ -1,11 +1,13 @@
+const { GoogleGenerativeAI } = require("@google/generative-ai");
+const miniMaxTextService = require('./minimaxTextService');
 const grokTextService = require('./grokTextService');
-const { getBaseImageStyle } = require('./imageGenService');
+const grokCliService = require('./grokCliService');
 const { log } = require('../utils/logger');
 const fs = require('fs');
 const path = require('path');
 
-// Shared visual style to keep frames consistent (owned by imageGenService, IMAGE_STYLE env).
-const BASE_IMAGE_STYLE = getBaseImageStyle();
+// Shared visual style to keep frames consistent (also mirrored in imageGenService).
+const BASE_IMAGE_STYLE = process.env.GEMINI_IMAGE_STYLE || "Cinematic neon-noir, teal-magenta palette, volumetric rain and fog, soft bloom, anamorphic lens, shallow depth of field, subtle film grain, 16:9 composition";
 
 // Fallback storyboard data (The "Seed" story)
 const FALLBACK_STORYBOARD = [
@@ -68,14 +70,50 @@ const retry = async (fn, attempts = 2, delayMs = 400) => {
   throw lastErr;
 };
 
-const hasConfiguredTextApiKey = () => grokTextService.hasApiKey();
+const getTextProvider = () => (process.env.LLM_PROVIDER || '').trim().toLowerCase();
+const isMiniMaxTextProvider = () => getTextProvider() === 'minimax';
+const isGrokTextProvider = () => getTextProvider() === 'grok' || getTextProvider() === 'xai';
+const isGrokCliTextProvider = () => getTextProvider() === 'grok-cli' || getTextProvider() === 'grok_cli';
 
-const getConfiguredTextModel = () => grokTextService.getModel();
+const hasValidApiKey = (apiKey) => Boolean(
+  apiKey && apiKey.trim() !== '' && !apiKey.startsWith('your_')
+);
 
-const generateTextContent = async (promptParts) => grokTextService.generateContent(promptParts);
+const hasConfiguredTextApiKey = () => {
+  if (isMiniMaxTextProvider()) return miniMaxTextService.hasApiKey();
+  if (isGrokTextProvider()) return grokTextService.hasApiKey();
+  if (isGrokCliTextProvider()) return grokCliService.isAvailable();
+  return hasValidApiKey(process.env.GEMINI_API_KEY);
+};
 
-// Reasoning models may echo <think>...</think> blocks inline; strip them before
-// parsing structured JSON.
+const getConfiguredTextModel = (fallbackModel = '') => {
+  if (isMiniMaxTextProvider()) return miniMaxTextService.getModel();
+  if (isGrokTextProvider()) return grokTextService.getModel();
+  if (isGrokCliTextProvider()) return grokCliService.getConfig().model || 'grok-build';
+  return fallbackModel;
+};
+
+const generateTextContent = async (promptParts, fallbackModel) => {
+  if (isMiniMaxTextProvider()) {
+    return await miniMaxTextService.generateContent(promptParts);
+  }
+  if (isGrokTextProvider()) {
+    return await grokTextService.generateContent(promptParts);
+  }
+  if (isGrokCliTextProvider()) {
+    return await grokCliService.generateText(promptParts);
+  }
+
+  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+  const model = genAI.getGenerativeModel({ model: fallbackModel });
+  const result = await model.generateContent(promptParts);
+  const response = await result.response;
+  return response.text();
+};
+
+// MiniMax M3 defaults to adaptive thinking and returns the reasoning inline as
+// <think>...</think> inside message.content (M2.x cannot disable it either), so
+// strip reasoning blocks before parsing structured JSON.
 const stripReasoning = (text) => String(text).replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 
 exports.getConfiguredTextModel = getConfiguredTextModel;
@@ -94,6 +132,8 @@ try {
 }
 
 exports.analyzeShotTransition = async (shotA, shotB) => {
+  const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash"; // Using Flash for speed
+
   if (!hasConfiguredTextApiKey()) {
     throw new Error("No valid API key found for transition analysis.");
   }
@@ -163,7 +203,7 @@ exports.analyzeShotTransition = async (shotA, shotB) => {
       `}
     ];
 
-    let text = await retry(() => generateTextContent(promptParts));
+    let text = await retry(() => generateTextContent(promptParts, geminiModel));
     text = stripReasoning(text.replace(/```json/g, "").replace(/```/g, ""));
     
     try {
@@ -188,7 +228,8 @@ exports.analyzeShotTransition = async (shotA, shotB) => {
 };
 
 exports.generatePrompts = async (sentence, shotCount = 6, styleOverride) => {
-  const configuredTextModel = getConfiguredTextModel();
+  const geminiTextModel = process.env.GEMINI_TEXT_MODEL || "gemini-3-pro-preview";
+  const configuredTextModel = getConfiguredTextModel(geminiTextModel);
   const appliedStyle = styleOverride && styleOverride.trim() !== '' ? styleOverride.trim() : BASE_IMAGE_STYLE;
 
   // Check if API key is not set OR if it's empty OR if it's still the placeholder value
@@ -319,7 +360,7 @@ exports.generatePrompts = async (sentence, shotCount = 6, styleOverride) => {
 ];
 
 
-    let text = await retry(() => generateTextContent(promptParts));
+    let text = await retry(() => generateTextContent(promptParts, geminiTextModel));
 
     // Clean up potential markdown formatting and any inline reasoning blocks
     text = stripReasoning(text.replace(/```json/g, "").replace(/```/g, ""));

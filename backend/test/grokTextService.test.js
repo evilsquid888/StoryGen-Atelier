@@ -92,14 +92,21 @@ test('rejects when the response carries an error or no text', async () => {
   );
 });
 
-test('reports the configured Grok text model', () => {
-  const previous = process.env.XAI_TEXT_MODEL;
+test('reports the configured Grok text model when LLM_PROVIDER=grok', () => {
+  const previousModel = process.env.XAI_TEXT_MODEL;
+  const previousProvider = process.env.LLM_PROVIDER;
   try {
+    process.env.LLM_PROVIDER = 'grok';
     process.env.XAI_TEXT_MODEL = 'grok-4.5';
-    assert.equal(llmService.getConfiguredTextModel(), 'grok-4.5');
+    assert.equal(llmService.getConfiguredTextModel('gemini-fallback'), 'grok-4.5');
     delete process.env.XAI_TEXT_MODEL;
-    assert.equal(llmService.getConfiguredTextModel(), 'grok-4.6');
+    assert.equal(llmService.getConfiguredTextModel('gemini-fallback'), 'grok-4.6');
+    process.env.LLM_PROVIDER = 'grok-cli';
+    assert.equal(llmService.getConfiguredTextModel('gemini-fallback'), 'grok-build');
+    process.env.LLM_PROVIDER = '';
+    assert.equal(llmService.getConfiguredTextModel('gemini-fallback'), 'gemini-fallback');
   } finally {
-    restoreEnv('XAI_TEXT_MODEL', previous);
+    restoreEnv('XAI_TEXT_MODEL', previousModel);
+    restoreEnv('LLM_PROVIDER', previousProvider);
   }
 });
