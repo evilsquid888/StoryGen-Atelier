@@ -1,13 +1,13 @@
 # StoryGen Atelier
 [English](README_EN.md) | [中文](README_CN.md)
 
-AI 辅助的分镜与视频生成工具。使用 Gemini 生成分镜文本与帧图，利用 Vertex AI Veo 生成过渡片段并拼接成全片，内置日志与画廊管理。
+AI 辅助的分镜与视频生成工具。使用 xAI Grok 生成分镜文本，Grok Imagine 生成帧图与过渡片段，并用 ffmpeg 拼接成全片，内置日志与画廊管理。一个 `XAI_API_KEY` 即可驱动全部功能。
 
 ![All Styles](exampleImg/all.png)
 
 ## 功能
-- **分镜生成**：Gemini 文本模型生成分镜脚本，Gemini 图像模型生成每帧图；支持自定义风格和镜头数。
-- **视频生成**：基于分镜的插帧链（Interpolation Chain），调用 Vertex Veo 生成片段并用 ffmpeg 拼接成整片。
+- **分镜生成**：Grok（Responses API）生成分镜脚本，Grok Imagine 生成每帧图；支持自定义风格和镜头数。
+- **视频生成**：基于分镜的插帧链（Interpolation Chain），调用 Grok Imagine Video 生成片段并用 ffmpeg 拼接成整片。
 - **日志面板**：视频日志 + 分镜日志（SQLite 持久化），支持查看/导出/清空。
 - **画廊**：保存、载入、删除已生成的分镜 + 视频。
 - **提示指南**：内置 `guide/VideoGenerationPromptGuide.md` 供模型提示参考。
@@ -15,14 +15,14 @@ AI 辅助的分镜与视频生成工具。使用 Gemini 生成分镜文本与帧
 ## 核心技术：视频生成与拼接算法
 本项目采用 **"插值链" (Interpolation Chain / Sliding Window)** 策略，将静态的分镜图片转化为连贯的视频故事。该过程完全自动化，主要包含以下三个阶段：
 
-### 1. 过渡分析 (Transition Analysis) - Gemini
+### 1. 过渡分析 (Transition Analysis) - Grok
 系统首先遍历分镜列表，使用滑动窗口处理每一对相邻镜头（Shot A → Shot B）。
-- **智能分析**：调用 **Gemini** 模型分析 Shot A 和 Shot B 的视觉内容。
-- **生成指令**：Gemini 输出一段特定的 **过渡提示词 (Transition Prompt)** 和建议的 **持续时间**，详细描述如何从第一个画面平滑运镜过渡到第二个画面（例如："Slow dolly zoom in while panning right..."）。
+- **智能分析**：调用 **Grok**（视觉输入）分析 Shot A 和 Shot B 的视觉内容。
+- **生成指令**：Grok 输出一段特定的 **过渡提示词 (Transition Prompt)** 和建议的 **持续时间**，详细描述如何从第一个画面平滑运镜过渡到第二个画面（例如："Slow dolly zoom in while panning right..."）。
 
-### 2. 独立片段生成 (Clip Generation) - Vertex AI Veo
-基于第一步的分析结果，并行调用 **Vertex AI (Veo 模型)** 生成视频片段。
-- **中间过渡**：对于每一对镜头 (A, B)，将 Gemini 生成的提示词 + Shot A (起始帧) + Shot B (结束帧) 发送给 Veo，生成一段连接两者的视频片段。
+### 2. 独立片段生成 (Clip Generation) - Grok Imagine Video
+基于第一步的分析结果，并行调用 **Grok Imagine Video** 生成视频片段。
+- **中间过渡**：对于每一对镜头 (A, B)，将 Grok 生成的提示词 + Shot A (起始帧) + Shot B (固定为 `last_frame`) 发送给 Grok Imagine，生成一段连接两者的视频片段。
 - **结尾**：对于最后一个镜头 (Shot N)，系统会单独生成一个 "Closing Shot" 片段（通常为 4-12秒），通过 "Hold on the final frame with a gentle cinematic finish" 等提示词，让故事有一个优雅的静止或微动结尾。
 
 ### 3. 最终拼接 (Final Assembly) - FFmpeg
@@ -33,11 +33,11 @@ AI 辅助的分镜与视频生成工具。使用 Gemini 生成分镜文本与帧
 ## 技术栈
 - **前端**: React, Vite, Mantine UI (组件库)
 - **后端**: Node.js (Express), better-sqlite3 (高性能数据存储), fluent-ffmpeg (视频拼接)
-- **AI 服务**: Google Gemini (文本/图像), Google Vertex AI Veo (视频生成)
+- **AI 服务**: xAI Grok（文本），Grok Imagine（图像 + 视频）
 
 ## 目录结构
 ```
-backend/    Node.js + Express API，调用 Gemini/Vertex，管理日志与数据
+backend/    Node.js + Express API，调用 xAI Grok API，管理日志与数据
 frontend/   React + Vite + Mantine UI
 guide/      提示词指南
 exampleImg/ README 用的示例分镜帧图（从本地数据导出）
@@ -47,35 +47,25 @@ backend.log / frontend.log 运行期日志
 ## 运行要求
 - Node.js 18+，npm
 - ffmpeg
-- **Google Cloud 项目**：必须启用 **Vertex AI API**（Veo 模型用于视频生成）
-- **Gemini API Key**：用于分镜脚本与图像生成
-- **MiniMax API Key（可选）**：配置后文本 / 帧图 / 片段可改走 MiniMax-M3 / image-01 / MiniMax-H3
+- **xAI API Key**：在 https://console.x.ai 创建，用于分镜文本、帧图与视频片段
 
 ## 环境变量
 在 `backend/.env`（可复制 `.env.example`）配置：
 ```
 PORT=3005
-GEMINI_API_KEY=你的_gemini_api_key
-GEMINI_TEXT_MODEL=gemini-3-pro-preview
-GEMINI_IMAGE_MODEL=gemini-3-pro-image-preview
-# Vertex AI (视频生成必须配置)
-VERTEX_PROJECT_ID=你的_gcp_project_id
-VERTEX_LOCATION=us-central1
-VERTEX_VEO_MODEL=veo-3.1-generate-preview
-
-# MiniMax（可选：文本 / 图像 / 视频）
-MINIMAX_API_KEY=
-MINIMAX_API_REGION=global_en   # global_en -> api.minimax.io，cn_zh -> api.minimaxi.com
-LLM_PROVIDER=                  # 设为 "minimax" 时，分镜与转场文本走 MiniMax-M3
-MINIMAX_TEXT_MODEL=MiniMax-M3
-IMAGE_PROVIDER=                # 设为 "minimax" 时，分镜帧图走 image-01
-MINIMAX_IMAGE_MODEL=image-01
-VIDEO_PROVIDER=                # 设为 "minimax" 时，视频片段走 MiniMax-H3（替代 Vertex Veo）
-MINIMAX_VIDEO_MODEL=MiniMax-H3
-MINIMAX_VIDEO_RESOLUTION=2K
+# xAI Grok — one key covers text, image, and video
+XAI_API_KEY=your_xai_api_key
+XAI_TEXT_MODEL=grok-4.6                    # storyboard scripts + transition analysis
+XAI_IMAGE_MODEL=grok-imagine-image-2.0     # storyboard frames
+XAI_IMAGE_RESOLUTION=1k                    # 1k or 2k
+XAI_VIDEO_MODEL=grok-imagine-video-1.5     # transition clips
+XAI_VIDEO_RESOLUTION=720p                  # 480p / 720p / 1080p
+XAI_VIDEO_ASPECT_RATIO=16:9
+XAI_VIDEO_GENERATE_AUDIO=true
+IMAGE_STYLE=                               # optional default look when the UI passes no style
 ```
 
-MiniMax 为可选路径：三个 PROVIDER 变量留空即沿用 Gemini/Vertex；图像与视频在配置 `MINIMAX_API_KEY` 后会自动切换。其余变量（M3 思考开关、区域/host 覆盖、时长与比例、回调地址等）见 `backend/.env.example`。
+只有 `XAI_API_KEY` 是必填项，其余变量都有可用默认值。未配置 Key 时后端返回内置示例分镜与占位帧图，视频生成不可用。
 
 ## 快速启动 (推荐)
 无需分别启动前后端，直接在根目录运行：

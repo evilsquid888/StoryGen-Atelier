@@ -1,11 +1,11 @@
-const { GoogleGenerativeAI } = require("@google/generative-ai");
-const miniMaxTextService = require('./minimaxTextService');
+const grokTextService = require('./grokTextService');
+const { getBaseImageStyle } = require('./imageGenService');
 const { log } = require('../utils/logger');
 const fs = require('fs');
 const path = require('path');
 
-// Shared visual style to keep frames consistent (also mirrored in imageGenService).
-const BASE_IMAGE_STYLE = process.env.GEMINI_IMAGE_STYLE || "Cinematic neon-noir, teal-magenta palette, volumetric rain and fog, soft bloom, anamorphic lens, shallow depth of field, subtle film grain, 16:9 composition";
+// Shared visual style to keep frames consistent (owned by imageGenService, IMAGE_STYLE env).
+const BASE_IMAGE_STYLE = getBaseImageStyle();
 
 // Fallback storyboard data (The "Seed" story)
 const FALLBACK_STORYBOARD = [
@@ -68,37 +68,14 @@ const retry = async (fn, attempts = 2, delayMs = 400) => {
   throw lastErr;
 };
 
-const isMiniMaxTextProvider = () => (process.env.LLM_PROVIDER || '').trim().toLowerCase() === 'minimax';
+const hasConfiguredTextApiKey = () => grokTextService.hasApiKey();
 
-const hasValidApiKey = (apiKey) => Boolean(
-  apiKey && apiKey.trim() !== '' && !apiKey.startsWith('your_')
-);
+const getConfiguredTextModel = () => grokTextService.getModel();
 
-const hasConfiguredTextApiKey = () => (
-  isMiniMaxTextProvider()
-    ? miniMaxTextService.hasApiKey()
-    : hasValidApiKey(process.env.GEMINI_API_KEY)
-);
+const generateTextContent = async (promptParts) => grokTextService.generateContent(promptParts);
 
-const getConfiguredTextModel = (fallbackModel = '') => (
-  isMiniMaxTextProvider() ? miniMaxTextService.getModel() : fallbackModel
-);
-
-const generateTextContent = async (promptParts, fallbackModel) => {
-  if (isMiniMaxTextProvider()) {
-    return await miniMaxTextService.generateContent(promptParts);
-  }
-
-  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-  const model = genAI.getGenerativeModel({ model: fallbackModel });
-  const result = await model.generateContent(promptParts);
-  const response = await result.response;
-  return response.text();
-};
-
-// MiniMax M3 defaults to adaptive thinking and returns the reasoning inline as
-// <think>...</think> inside message.content (M2.x cannot disable it either), so
-// strip reasoning blocks before parsing structured JSON.
+// Reasoning models may echo <think>...</think> blocks inline; strip them before
+// parsing structured JSON.
 const stripReasoning = (text) => String(text).replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 
 exports.getConfiguredTextModel = getConfiguredTextModel;
@@ -117,8 +94,6 @@ try {
 }
 
 exports.analyzeShotTransition = async (shotA, shotB) => {
-  const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash"; // Using Flash for speed
-
   if (!hasConfiguredTextApiKey()) {
     throw new Error("No valid API key found for transition analysis.");
   }
@@ -188,7 +163,7 @@ exports.analyzeShotTransition = async (shotA, shotB) => {
       `}
     ];
 
-    let text = await retry(() => generateTextContent(promptParts, geminiModel));
+    let text = await retry(() => generateTextContent(promptParts));
     text = stripReasoning(text.replace(/```json/g, "").replace(/```/g, ""));
     
     try {
@@ -213,8 +188,7 @@ exports.analyzeShotTransition = async (shotA, shotB) => {
 };
 
 exports.generatePrompts = async (sentence, shotCount = 6, styleOverride) => {
-  const geminiTextModel = process.env.GEMINI_TEXT_MODEL || "gemini-3-pro-preview";
-  const configuredTextModel = getConfiguredTextModel(geminiTextModel);
+  const configuredTextModel = getConfiguredTextModel();
   const appliedStyle = styleOverride && styleOverride.trim() !== '' ? styleOverride.trim() : BASE_IMAGE_STYLE;
 
   // Check if API key is not set OR if it's empty OR if it's still the placeholder value
@@ -345,7 +319,7 @@ exports.generatePrompts = async (sentence, shotCount = 6, styleOverride) => {
 ];
 
 
-    let text = await retry(() => generateTextContent(promptParts, geminiTextModel));
+    let text = await retry(() => generateTextContent(promptParts));
 
     // Clean up potential markdown formatting and any inline reasoning blocks
     text = stripReasoning(text.replace(/```json/g, "").replace(/```/g, ""));
