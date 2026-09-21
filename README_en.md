@@ -1,13 +1,13 @@
 # StoryGen Atelier
 [English](README_EN.md) | [中文](README_CN.md)
 
-AI-assisted storyboard and video generation tool. Uses xAI Grok for storyboard text, Grok Imagine for frames and transition clips, and ffmpeg for stitching the final video. One `XAI_API_KEY` covers everything. Built-in logs and gallery management.
+AI-assisted storyboard and video generation tool. Uses Gemini for generating storyboard text and frames, Vertex AI Veo for generating transition clips, and ffmpeg for stitching the final video. Every stage can also be switched to MiniMax, the xAI Grok API, or the Grok Build CLI. Built-in logs and gallery management.
 
 ![All Styles](exampleImg/all.png)
 
 ## Features
-- **Storyboard Generation**: Grok (Responses API) writes the storyboard script, and Grok Imagine renders each frame; supports custom styles and shot counts.
-- **Video Generation**: Based on the Interpolation Chain of the storyboard, calls Grok Imagine Video to generate clips and stitches them into a full video using ffmpeg.
+- **Storyboard Generation**: Gemini text model generates storyboard scripts, and Gemini image model generates frames; supports custom styles and shot counts.
+- **Video Generation**: Based on the Interpolation Chain of the storyboard, calls Vertex Veo to generate clips and stitches them into a full video using ffmpeg.
 - **Logs Dashboard**: Video logs + Storyboard logs (SQLite persistence), supports viewing, exporting, and clearing.
 - **Gallery**: Save, load, and delete generated storyboards + videos.
 - **Prompt Guide**: Built-in `guide/VideoGenerationPromptGuide.md` for model prompting reference.
@@ -15,14 +15,14 @@ AI-assisted storyboard and video generation tool. Uses xAI Grok for storyboard t
 ## Core Technology: Video Generation & Stitching Algorithm
 This project uses an **"Interpolation Chain" (Sliding Window)** strategy to transform static storyboard images into a coherent video story. The process is fully automated and consists of three main phases:
 
-### 1. Transition Analysis - Grok
+### 1. Transition Analysis - Gemini
 The system first iterates through the storyboard list using a sliding window to process each pair of adjacent shots (Shot A → Shot B).
-- **Intelligent Analysis**: Calls **Grok** (vision input) to analyze the visual content of Shot A and Shot B.
-- **Instruction Generation**: Grok outputs a specific **Transition Prompt** and a suggested **Duration**, detailing how to smoothly transition from the first frame to the second (e.g., "Slow dolly zoom in while panning right...").
+- **Intelligent Analysis**: Calls the **Gemini** model to analyze the visual content of Shot A and Shot B.
+- **Instruction Generation**: Gemini outputs a specific **Transition Prompt** and a suggested **Duration**, detailing how to smoothly transition from the first frame to the second (e.g., "Slow dolly zoom in while panning right...").
 
-### 2. Clip Generation - Grok Imagine Video
-Based on the analysis from step 1, **Grok Imagine Video** is called in parallel to generate video clips.
-- **Intermediate Transitions**: For each pair of shots (A, B), the Grok-generated prompt + Shot A (start frame) + Shot B (pinned `last_frame`) are sent to Grok Imagine to generate a connecting video clip.
+### 2. Clip Generation - Vertex AI Veo
+Based on the analysis from step 1, **Vertex AI (Veo model)** is called in parallel to generate video clips.
+- **Intermediate Transitions**: For each pair of shots (A, B), the Gemini-generated prompt + Shot A (start frame) + Shot B (end frame) are sent to Veo to generate a connecting video clip.
 - **Closing Shot**: For the final shot (Shot N), the system generates a separate "Closing Shot" clip, using prompts like "Hold on the final frame with a gentle cinematic finish" to give the story an elegant static or subtle ending.
 
 ### 3. Final Assembly - FFmpeg
@@ -33,11 +33,11 @@ Once all clips (transition clips + closing clip) are generated, the backend uses
 ## Tech Stack
 - **Frontend**: React, Vite, Mantine UI (Component Library)
 - **Backend**: Node.js (Express), better-sqlite3 (High-performance data storage), fluent-ffmpeg (Video stitching)
-- **AI Services**: xAI Grok (Text), Grok Imagine (Image + Video)
+- **AI Services**: Google Gemini (Text/Image), Google Vertex AI Veo (Video Generation); optional MiniMax, xAI Grok API (grok-4.6 + Grok Imagine), or Grok Build CLI for any stage
 
 ## Directory Structure
 ```
-backend/    Node.js + Express API, calls the xAI Grok API, manages logs & data
+backend/    Node.js + Express API, calls Gemini/Vertex, manages logs & data
 frontend/   React + Vite + Mantine UI
 guide/      Prompt guides
 exampleImg/ Example storyboard frames for README (exported from local data)
@@ -47,25 +47,52 @@ backend.log / frontend.log Runtime logs
 ## Requirements
 - Node.js 18+, npm
 - ffmpeg
-- **xAI API Key**: Create one at https://console.x.ai. Used for storyboard text, frames, and video clips.
+- **Google Cloud Project**: Must enable **Vertex AI API** (Veo model used for video generation)
+- **Gemini API Key**: Used for storyboard script and image generation
+- **MiniMax API Key (optional)**: Switch text, frames, or clips to MiniMax-M3 / image-01 / MiniMax-H3
+- **xAI API Key (optional)**: Switch text, frames, or clips to grok-4.6 / Grok Imagine image / Grok Imagine video
+- **Grok Build CLI (optional)**: Same Grok models through your SuperGrok / X Premium+ login, no API key needed
 
 ## Environment Variables
 Configure in `backend/.env` (copy from `.env.example`):
 ```
 PORT=3005
-# xAI Grok — one key covers text, image, and video
-XAI_API_KEY=your_xai_api_key
-XAI_TEXT_MODEL=grok-4.6                    # storyboard scripts + transition analysis
-XAI_IMAGE_MODEL=grok-imagine-image-2.0     # storyboard frames
-XAI_IMAGE_RESOLUTION=1k                    # 1k or 2k
-XAI_VIDEO_MODEL=grok-imagine-video-1.5     # transition clips
-XAI_VIDEO_RESOLUTION=720p                  # 480p / 720p / 1080p
-XAI_VIDEO_ASPECT_RATIO=16:9
-XAI_VIDEO_GENERATE_AUDIO=true
-IMAGE_STYLE=                               # optional default look when the UI passes no style
+GEMINI_API_KEY=your_gemini_api_key
+GEMINI_TEXT_MODEL=gemini-3-pro-preview
+GEMINI_IMAGE_MODEL=gemini-3-pro-image-preview
+# Vertex AI (Required for video generation)
+VERTEX_PROJECT_ID=your_gcp_project_id
+VERTEX_LOCATION=us-central1
+VERTEX_VEO_MODEL=veo-3.1-generate-preview
+
+# MiniMax (optional text / image / video provider)
+MINIMAX_API_KEY=
+MINIMAX_API_REGION=global_en   # global_en -> api.minimax.io, cn_zh -> api.minimaxi.com
+LLM_PROVIDER=                  # "minimax" routes storyboard + transition text to MiniMax-M3
+MINIMAX_TEXT_MODEL=MiniMax-M3
+IMAGE_PROVIDER=                # "minimax" uses image-01 for storyboard frames
+MINIMAX_IMAGE_MODEL=image-01
+VIDEO_PROVIDER=                # "minimax" generates clips with MiniMax-H3 instead of Vertex Veo
+MINIMAX_VIDEO_MODEL=MiniMax-H3
+MINIMAX_VIDEO_RESOLUTION=2K
+
+# xAI Grok API (optional text / image / video provider)
+XAI_API_KEY=
+LLM_PROVIDER=grok              # or IMAGE_PROVIDER=grok / VIDEO_PROVIDER=grok
+XAI_TEXT_MODEL=grok-4.6
+XAI_IMAGE_MODEL=grok-imagine-image-2.0
+XAI_VIDEO_MODEL=grok-imagine-video-1.5
+XAI_VIDEO_RESOLUTION=720p
+
+# Grok Build CLI (optional; `grok login` once, then pick it per stage)
+LLM_PROVIDER=grok-cli          # or IMAGE_PROVIDER=grok-cli / VIDEO_PROVIDER=grok-cli
+GROK_CLI_BIN=                  # leave empty to use `grok` from PATH
+GROK_CLI_VIDEO_RESOLUTION=720p
 ```
 
-Only `XAI_API_KEY` is required; every other variable has a working default. Without a key the backend serves the built-in sample storyboard with placeholder frames, and video generation is disabled.
+Providers are selected per stage with `LLM_PROVIDER` / `IMAGE_PROVIDER` / `VIDEO_PROVIDER`, each accepting `minimax`, `grok` (xAI API), or `grok-cli` (Grok Build). Leave them empty to keep Gemini and Vertex; image and video switch to MiniMax automatically once `MINIMAX_API_KEY` is set. `backend/.env.example` lists the remaining knobs.
+
+**Grok Build CLI**: install with `curl -fsSL https://x.ai/cli/install.sh | bash`, run `grok login` (or `grok login --device-code` on a headless box), then set the `*_PROVIDER` variables to `grok-cli`. The backend drives `grok` headlessly: storyboard text via `--prompt-json`, frames via the `image_gen` / `image_edit` tools, and clips via `reference_to_video` (first + last frame pinned) or `image_to_video` for the closing shot. Video generation through the CLI needs a SuperGrok tier.
 
 ## Quick Start (Recommended)
 No need to start backend and frontend separately. Run from the root directory:

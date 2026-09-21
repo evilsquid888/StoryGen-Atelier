@@ -1,13 +1,13 @@
 // StoryGenApp/backend/src/services/videoService.js
-// Interpolation-chain video pipeline: Grok analyzes each shot pair, Grok Imagine
-// renders the transition clips, and ffmpeg stitches them.
 
 const fs = require('fs');
 const path = require('path');
 const { fetch } = require('undici');
 const { log } = require('../utils/logger');
 const { analyzeShotTransition } = require('./llmService');
+const { GoogleAuth } = require('google-auth-library');
 const grokVideoService = require('./grokVideoService');
+const grokCliService = require('./grokCliService');
 const videoLogStore = require('./videoLogStore');
 
 const dataDir = path.join(__dirname, '../../data');
@@ -51,27 +51,421 @@ const readImageBytes = async (imageUrl) => {
   throw new Error(`Unsupported image URL/path format: ${imageUrl}`);
 };
 
-// Generate one clip with Grok Imagine and save it under data/videos.
-const generateClipDirectly = async (params) => {
-  const firstFrame = await readImageBytes(params.first_frame_url);
-  const lastFrame = await readImageBytes(params.last_frame_url);
-  if (!firstFrame) throw new Error('A first frame image is required for clip generation');
+// Vertex AI video generation call
+const startVideoJobVertex = async ({ prompt, model, firstFrame, lastFrame, durationSeconds }) => {
+  const projectId = process.env.VERTEX_PROJECT_ID;
+  const location = process.env.VERTEX_LOCATION || 'us-central1';
+  if (!projectId) throw new Error('VERTEX_PROJECT_ID is required for Vertex fallback');
 
-  const downloadUrl = await grokVideoService.generateVideo({
-    prompt: params.prompt,
-    firstFrame,
-    lastFrame,
-    durationSeconds: params.duration_seconds,
+  const modelId = model.startsWith('publishers/') ? model : `publishers/google/models/${model}`;
+  const url = `https://${location}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${location}/${modelId}:predictLongRunning`;
+
+  const auth = new GoogleAuth({ scopes: ['https://www.googleapis.com/auth/cloud-platform'] });
+  const client = await auth.getClient();
+  const token = await client.getAccessToken();
+
+  // 调试：看看这个 token 属于谁
+  // try {
+  //   const infoRes = await fetch(`https://oauth2.googleapis.com/tokeninfo?access_token=${token?.token || token}`);
+  //   const infoJson = await infoRes.json();
+  //   log('vertex_auth_identity', infoJson); // 这里面会有 email / sub 等
+  // } catch (e) {
+  //   console.warn('Failed to introspect token', e);
+  // }
+ 
+  const instance = {
+    prompt: prompt,
+  };
+  
+  // Construct image payload for Vertex REST API
+  if (firstFrame) {
+      instance.image = firstFrame;
+  }
+  if (lastFrame) {
+      instance.lastFrame = lastFrame;
+  }
+
+  const body = {
+    instances: [instance],
+    parameters: {
+        aspectRatio: "16:9",
+        durationSeconds: durationSeconds,
+        resolution: "1080p",
+        personGeneration: "allow_all",
+        enhancePrompt: true,
+        generateAudio: true
+    }
+  };
+
+  log('vertex_start_request', { url, modelId });
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token?.token || token}`,
+    },
+    body: JSON.stringify(body),
+  });
+  
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to start vertex video job: ${res.status} ${text}`);
+  }
+  
+  const json = await res.json();
+  return json.name; 
+};
+
+const pollOperationVertex = async (name, maxAttempts = 60, delayMs = 40000) => {
+  const projectId = process.env.VERTEX_PROJECT_ID;
+  const location = process.env.VERTEX_LOCATION || 'us-central1';
+  const auth = new GoogleAuth({ scopes: ['https://www.googleapis.com/auth/cloud-platform'] });
+  const client = await auth.getClient();
+  const token = await client.getAccessToken();
+  log('vertex_poll_auth_success', { location, projectId });
+
+  const modelId = process.env.VERTEX_VEO_MODEL_ID || 'veo-3.1-generate-preview';
+  const pollUrl = `https://${location}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${location}/publishers/google/models/${modelId}:fetchPredictOperation`;
+  
+  for (let i = 0; i < maxAttempts; i++) {
+    const res = await fetch(pollUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token?.token || token}`
+      },
+      body: JSON.stringify({ operationName: name })
+    });
+    
+    if (!res.ok) {
+      const text = await res.text();
+      log('vertex_poll_error', { status: res.status, message: text });
+      await new Promise((r) => setTimeout(r, delayMs));
+      continue;
+    }
+    
+    const json = await res.json();
+    if (json.error) throw new Error(`Vertex operation error: ${json.error.message}`);
+    
+    if (json.done) {
+        if (json.response && json.response.error) {
+             throw new Error(`Video generation failed: ${json.response.error.message}`);
+        }
+        return json;
+    }
+    
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  throw new Error('Vertex video generation timed out');
+};
+
+const extractVideoUriVertex = (op) => {
+    const samples = op?.response?.generateVideoResponse?.generatedSamples;
+    if (samples && samples.length > 0 && samples[0].video && samples[0].video.uri) {
+        return samples[0].video.uri;
+    }
+  if (op?.response?.videos && op.response.videos.length > 0 && op.response.videos[0].bytesBase64Encoded) {
+        return { base64: op.response.videos[0].bytesBase64Encoded };
+    }
+    return null;
+};
+
+const MINIMAX_VIDEO_REGION_HOSTS = {
+  global_en: 'https://api.minimax.io/v2',
+  cn_zh: 'https://api.minimaxi.com/v2',
+};
+
+const MINIMAX_VIDEO_ROLES = new Set([
+  'first_frame',
+  'last_frame',
+  'reference_image',
+  'reference_video',
+  'reference_audio',
+]);
+
+const getMiniMaxVideoBaseUrl = () => {
+  const explicit = process.env.MINIMAX_VIDEO_API_HOST;
+  if (explicit && explicit.trim() !== '') return explicit.trim().replace(/\/+$/, '');
+  const region = (process.env.MINIMAX_API_REGION || 'global_en').trim();
+  return MINIMAX_VIDEO_REGION_HOSTS[region] || MINIMAX_VIDEO_REGION_HOSTS.global_en;
+};
+
+const getMiniMaxVideoApiKey = () => {
+  const apiKey = process.env.MINIMAX_API_KEY;
+  if (!apiKey || apiKey.trim() === '') {
+    throw new Error('MINIMAX_API_KEY is required for MiniMax video generation');
+  }
+  return apiKey.trim();
+};
+
+// Note: a plain substring test matches every MiniMax model name ("MiniMax").
+const isMiniMaxH3Max = (model) => /-max$/i.test(String(model || '').trim());
+
+const normalizeMiniMaxVideoDuration = (durationSeconds, model) => {
+  const configured = Number.parseInt(process.env.MINIMAX_VIDEO_DURATION || '', 10);
+  const requested = Number.parseInt(durationSeconds, 10);
+  const duration = Number.isInteger(configured) ? configured : requested;
+  if (!Number.isInteger(duration)) return 6;
+  // H3 accepts 4-15s; H3-Max starts at 5s.
+  return Math.min(15, Math.max(isMiniMaxH3Max(model) ? 5 : 4, duration));
+};
+
+const buildMiniMaxImageContent = (imageBytes, role) => {
+  if (!imageBytes) return null;
+  return {
+    type: 'image_url',
+    image_url: {
+      url: `data:${imageBytes.mimeType};base64,${imageBytes.bytesBase64Encoded}`,
+    },
+    role,
+  };
+};
+
+const buildMiniMaxVideoContent = ({ prompt, firstFrame, lastFrame, referenceMedia = [] }) => {
+  const text = (prompt || '').trim();
+  if (!text) throw new Error('A prompt is required for MiniMax video generation');
+
+  const content = [{ type: 'text', text: text.slice(0, 7000) }];
+  const references = Array.isArray(referenceMedia)
+    ? referenceMedia.filter((item) => item && MINIMAX_VIDEO_ROLES.has(item.role))
+    : [];
+  const hasReferences = references.some((item) => item.role.startsWith('reference_'));
+
+  if (hasReferences && (firstFrame || lastFrame)) {
+    throw new Error('MiniMax reference media cannot be mixed with first or last frame inputs');
+  }
+
+  if (hasReferences) {
+    for (const item of references) {
+      if (item.role === 'reference_image') {
+        content.push({ type: 'image_url', image_url: { url: item.url }, role: item.role });
+      } else if (item.role === 'reference_video') {
+        content.push({ type: 'video_url', video_url: { url: item.url }, role: item.role });
+      } else if (item.role === 'reference_audio') {
+        content.push({ type: 'audio_url', audio_url: { url: item.url }, role: item.role });
+      }
+    }
+    return content;
+  }
+
+  const firstContent = buildMiniMaxImageContent(firstFrame, 'first_frame');
+  const lastContent = buildMiniMaxImageContent(lastFrame, 'last_frame');
+  if (firstContent) content.push(firstContent);
+  if (lastContent) content.push(lastContent);
+
+  return content;
+};
+
+const requestMiniMaxVideo = async (pathSuffix, options = {}) => {
+  const baseUrl = getMiniMaxVideoBaseUrl();
+  const res = await fetch(`${baseUrl}${pathSuffix}`, {
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+      Authorization: `Bearer ${getMiniMaxVideoApiKey()}`,
+    },
   });
 
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`MiniMax video request failed: ${res.status} ${text}`);
+  }
+
+  return await res.json();
+};
+
+const createMiniMaxVideoTask = async ({ prompt, model, firstFrame, lastFrame, durationSeconds, referenceMedia }) => {
+  const resolvedModel = model || process.env.MINIMAX_VIDEO_MODEL || 'MiniMax-H3';
+  const duration = normalizeMiniMaxVideoDuration(durationSeconds, resolvedModel);
+  const body = {
+    model: resolvedModel,
+    content: buildMiniMaxVideoContent({ prompt, firstFrame, lastFrame, referenceMedia }),
+    // H3 supports 768P/2K; H3-Max is limited to 480P/768P.
+    resolution: process.env.MINIMAX_VIDEO_RESOLUTION || (isMiniMaxH3Max(resolvedModel) ? '768P' : '2K'),
+    duration,
+    ratio: process.env.MINIMAX_VIDEO_RATIO || 'adaptive',
+  };
+
+  if (process.env.MINIMAX_VIDEO_CALLBACK_URL) {
+    body.callback_url = process.env.MINIMAX_VIDEO_CALLBACK_URL;
+  }
+
+  log('minimax_video_create_request', { model: body.model, duration: body.duration, resolution: body.resolution });
+  const json = await requestMiniMaxVideo('/video_generation', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  if (!json.task_id) throw new Error('MiniMax did not return a task_id');
+  return json.task_id;
+};
+
+const queryMiniMaxVideoTask = async (taskId) => {
+  if (!taskId) throw new Error('task_id is required for MiniMax video query');
+  return await requestMiniMaxVideo(`/query/video_generation/${encodeURIComponent(taskId)}`, { method: 'GET' });
+};
+
+const listMiniMaxVideoTasks = async (params = {}) => {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null || value === '') continue;
+    if (Array.isArray(value)) {
+      for (const item of value) query.append(key, item);
+    } else {
+      query.set(key, value);
+    }
+  }
+  const suffix = query.toString() ? `/query/video_generation?${query.toString()}` : '/query/video_generation';
+  return await requestMiniMaxVideo(suffix, { method: 'GET' });
+};
+
+const deleteMiniMaxVideoTask = async (taskId) => {
+  if (!taskId) throw new Error('task_id is required for MiniMax video delete');
+  return await requestMiniMaxVideo(`/video_generation/${encodeURIComponent(taskId)}`, { method: 'DELETE' });
+};
+
+const pollMiniMaxVideoTask = async (taskId, maxAttempts = 60, delayMs = 10000) => {
+  for (let i = 0; i < maxAttempts; i++) {
+    const json = await queryMiniMaxVideoTask(taskId);
+    const task = json.task || {};
+    const status = String(task.status || '').toLowerCase();
+    if (['succeeded', 'success', 'completed'].includes(status)) {
+      const url = task?.content?.url || task?.content?.[0]?.url || task?.content?.[0]?.video_url?.url;
+      if (!url) throw new Error('MiniMax task succeeded but returned no video URL');
+      return url;
+    }
+    if (['failed', 'fail', 'cancelled', 'canceled', 'expired'].includes(status)) {
+      const message = task?.error?.message || task.status;
+      throw new Error(`MiniMax video generation failed: ${message}`);
+    }
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  throw new Error('MiniMax video generation timed out');
+};
+
+const generateClipWithMiniMax = async ({ prompt, model, firstFrame, lastFrame, durationSeconds, referenceMedia }) => {
+  const taskId = await createMiniMaxVideoTask({
+    prompt,
+    model,
+    firstFrame,
+    lastFrame,
+    durationSeconds,
+    referenceMedia,
+  });
+  log('minimax_video_task_started', { taskId });
+
+  const downloadUrl = await pollMiniMaxVideoTask(taskId);
   const fileRes = await fetch(downloadUrl);
-  if (!fileRes.ok) throw new Error(`Failed to download Grok video: ${fileRes.status}`);
+  if (!fileRes.ok) throw new Error(`Failed to download MiniMax video: ${fileRes.status}`);
 
   const buffer = Buffer.from(await fileRes.arrayBuffer());
-  const fileName = `clip_grok_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp4`;
+  const fileName = `clip_minimax_${Date.now()}.mp4`;
   const outPath = path.join(videoDir, fileName);
   await fs.promises.writeFile(outPath, buffer);
+  return { video_path: outPath, provider: 'minimax' };
+};
+
+const generateClipWithVertex = async ({ prompt, model, firstFrame, lastFrame, durationSeconds }) => {
+  try {
+    const opName = await startVideoJobVertex({
+      prompt,
+      model,
+      firstFrame,
+      lastFrame,
+      durationSeconds
+    });
+    
+    log('vertex_clip_job_started', { opName });
+    
+    const opResult = await pollOperationVertex(opName);
+    const videoData = extractVideoUriVertex(opResult);
+    
+    if (!videoData) throw new Error("No video data found in Vertex response");
+    
+    if (videoData.base64) {
+        const fileName = `clip_vertex_${Date.now()}.mp4`;
+        const outPath = path.join(videoDir, fileName);
+        await fs.promises.writeFile(outPath, Buffer.from(videoData.base64, 'base64'));
+        return { video_path: outPath, provider: 'vertex' };
+    } else if (videoData.startsWith && videoData.startsWith('gs://')) {
+        // If it's a GCS URI, log and return the URI for now.
+        log('received_gcs_uri', { uri: videoData });
+        return { video_uri: videoData, provider: 'vertex' };
+    }
+    
+  } catch (e) {
+    console.error("Vertex generation failed:", e);
+    throw e;
+  }
+  return { video_path: null, provider: 'vertex' }; // Should not reach here
+};
+
+// xAI Grok Imagine Video: image-to-video with the next shot pinned as last_frame.
+const generateClipWithGrok = async ({ prompt, firstFrame, lastFrame, durationSeconds }) => {
+  const downloadUrl = await grokVideoService.generateVideo({ prompt, firstFrame, lastFrame, durationSeconds });
+  const fileRes = await fetch(downloadUrl);
+  if (!fileRes.ok) throw new Error(`Failed to download Grok video: ${fileRes.status}`);
+  const buffer = Buffer.from(await fileRes.arrayBuffer());
+  const outPath = path.join(videoDir, `clip_grok_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp4`);
+  await fs.promises.writeFile(outPath, buffer);
   return { video_path: outPath, provider: 'grok' };
+};
+
+// Grok Build CLI: reference_to_video (first + last frame) or image_to_video
+// (closing shot). The CLI saves the clip in its work dir; copy it next to the
+// other clips so stitching and cleanup stay in one place.
+const generateClipWithGrokCli = async ({ prompt, firstFrame, lastFrame, durationSeconds }) => {
+  const sourcePath = await grokCliService.generateVideo({ prompt, firstFrame, lastFrame, durationSeconds });
+  const outPath = path.join(videoDir, `clip_grokcli_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp4`);
+  await fs.promises.copyFile(sourcePath, outPath);
+  return { video_path: outPath, provider: 'grok-cli' };
+};
+
+// Main function: select the configured video provider.
+// VIDEO_PROVIDER = minimax | grok (xAI API) | grok-cli (Grok Build) | empty (Vertex Veo,
+// or MiniMax when MINIMAX_API_KEY is set).
+const generateClipDirectly = async (params) => {
+    const firstFrame = await readImageBytes(params.first_frame_url);
+    const lastFrame = await readImageBytes(params.last_frame_url);
+
+    const provider = (process.env.VIDEO_PROVIDER || '').trim().toLowerCase();
+
+    if (provider === 'grok' || provider === 'xai') {
+      return await generateClipWithGrok({
+        prompt: params.prompt, firstFrame, lastFrame, durationSeconds: params.duration_seconds,
+      });
+    }
+    if (provider === 'grok-cli' || provider === 'grok_cli') {
+      return await generateClipWithGrokCli({
+        prompt: params.prompt, firstFrame, lastFrame, durationSeconds: params.duration_seconds,
+      });
+    }
+    const useMiniMax = provider === 'minimax'
+      || (provider === '' && process.env.MINIMAX_API_KEY && process.env.MINIMAX_API_KEY.trim() !== '');
+
+    if (useMiniMax) {
+      return await generateClipWithMiniMax({
+        prompt: params.prompt,
+        model: params.model || process.env.MINIMAX_VIDEO_MODEL,
+        firstFrame,
+        lastFrame,
+        durationSeconds: params.duration_seconds,
+        referenceMedia: params.reference_media,
+      });
+    }
+    
+    const model = params.model || 'veo-3.1-generate-preview';
+    const shared = {
+      prompt: params.prompt,
+      model,
+      firstFrame,
+      lastFrame,
+      durationSeconds: params.duration_seconds
+    };
+
+    return await generateClipWithVertex(shared);
 };
 
 /**
@@ -153,14 +547,25 @@ exports.generateFullVideoFromShots = async (storyboard) => {
         try {
             log('generating_clip_start', { index, duration, closing: !!plan.isClosing });
             
+            // Use direct Node.js implementation instead of Python
             const result = await generateClipDirectly({
                 prompt: prompt,
                 duration_seconds: duration,
-                first_frame_url: shotA.imageUrl,
-                last_frame_url: shotB ? shotB.imageUrl : null, // null for the closing shot
+                first_frame_url: shotA.imageUrl, // Pass URLs directly
+                last_frame_url: shotB ? shotB.imageUrl : null, // Pass URLs directly (may be null for closing shot)
+                enhance_prompt: true,
+                generate_audio: true
             });
-
-            return { index, videoPath: result.video_path, prompt, duration, provider: result.provider };
+            
+            let videoPath = null;
+            if (result.video_path) {
+                videoPath = result.video_path;
+            } else if (result.video_uri) {
+                console.warn(`GCS URI returned: ${result.video_uri}. Direct download not implemented. If this is unexpected, ensure Vertex is configured to return video_bytes or an accessible URL.`);
+                throw new Error("GCS URI returned, direct download not fully supported in current implementation.");
+            }
+            
+            return { index, videoPath, prompt, duration, provider: result.provider || 'vertex' };
             
         } catch (e) {
             console.error(`Error generating clip for index ${index}:`, e);
@@ -246,3 +651,7 @@ exports.generateSequencedVideo = async (storyboard, segments) => {
 exports.generateVideosForSegments = async (storyboard, segments) => {
     return exports.generateFullVideoFromShots(storyboard);
 };
+exports.queryMiniMaxVideoTask = queryMiniMaxVideoTask;
+exports.listMiniMaxVideoTasks = listMiniMaxVideoTasks;
+exports.deleteMiniMaxVideoTask = deleteMiniMaxVideoTask;
+// Removed exports.stitchVideos as it's now internal to generateFullVideoFromShots
