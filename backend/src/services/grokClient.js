@@ -55,8 +55,22 @@ const request = async (pathSuffix, options = {}) => {
   return json;
 };
 
+// Wrap a bare base64 payload in a data URI, sniffing the real image type
+// (callers often strip the header and guess PNG for JPEG bytes).
+const toImageDataUri = (base64OrDataUri) => {
+  if (!base64OrDataUri) return null;
+  if (base64OrDataUri.startsWith('data:')) return base64OrDataUri;
+  const head = Buffer.from(base64OrDataUri.slice(0, 32), 'base64');
+  let mime = 'image/png';
+  if (head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) mime = 'image/jpeg';
+  else if (head.subarray(0, 4).toString('ascii') === 'RIFF') mime = 'image/webp';
+  else if (head.subarray(0, 4).toString('ascii') === 'GIF8') mime = 'image/gif';
+  return `data:${mime};base64,${base64OrDataUri}`;
+};
+
 module.exports = {
   DEFAULT_BASE_URL,
+  toImageDataUri,
   DEFAULT_TEXT_MODEL,
   DEFAULT_IMAGE_MODEL,
   DEFAULT_VIDEO_MODEL,

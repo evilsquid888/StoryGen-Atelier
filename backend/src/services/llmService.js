@@ -2,6 +2,7 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 const miniMaxTextService = require('./minimaxTextService');
 const grokTextService = require('./grokTextService');
 const grokCliService = require('./grokCliService');
+const { normalizeProvider, hasValidApiKey } = require('./providers');
 const { log } = require('../utils/logger');
 const fs = require('fs');
 const path = require('path');
@@ -70,14 +71,10 @@ const retry = async (fn, attempts = 2, delayMs = 400) => {
   throw lastErr;
 };
 
-const getTextProvider = () => (process.env.LLM_PROVIDER || '').trim().toLowerCase();
+const getTextProvider = () => normalizeProvider(process.env.LLM_PROVIDER);
 const isMiniMaxTextProvider = () => getTextProvider() === 'minimax';
-const isGrokTextProvider = () => getTextProvider() === 'grok' || getTextProvider() === 'xai';
-const isGrokCliTextProvider = () => getTextProvider() === 'grok-cli' || getTextProvider() === 'grok_cli';
-
-const hasValidApiKey = (apiKey) => Boolean(
-  apiKey && apiKey.trim() !== '' && !apiKey.startsWith('your_')
-);
+const isGrokTextProvider = () => getTextProvider() === 'grok';
+const isGrokCliTextProvider = () => getTextProvider() === 'grok-cli';
 
 const hasConfiguredTextApiKey = () => {
   if (isMiniMaxTextProvider()) return miniMaxTextService.hasApiKey();

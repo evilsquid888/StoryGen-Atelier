@@ -2,6 +2,7 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 const { fetch } = require("undici");
 const grokClient = require('./grokClient');
 const grokCliService = require('./grokCliService');
+const { normalizeProvider } = require('./providers');
 
 const BASE_IMAGE_STYLE = process.env.GEMINI_IMAGE_STYLE || "Cinematic neon-noir, teal-magenta palette, volumetric rain and fog, soft bloom, anamorphic lens, shallow depth of field, subtle film grain, 16:9 composition";
 
@@ -137,10 +138,7 @@ const generateImageWithGrok = async (imagePrompt, referenceImageBase64, { env, f
     const body = {
       ...common,
       prompt: `Reference image shows the main character. Generate a new image where this SAME character (identical appearance, clothing, colors) performs the action described below:\n\n${imagePrompt}`,
-      image: {
-        type: 'image_url',
-        url: referenceImageBase64.startsWith('data:') ? referenceImageBase64 : `data:image/png;base64,${referenceImageBase64}`,
-      },
+      image: { type: 'image_url', url: grokClient.toImageDataUri(referenceImageBase64) },
     };
     return extractGrokImage(await grokClient.request('/images/edits', { method: 'POST', env, fetchImpl, body: JSON.stringify(body) }));
   }
@@ -149,7 +147,7 @@ const generateImageWithGrok = async (imagePrompt, referenceImageBase64, { env, f
   }));
 };
 
-const getImageProvider = (env) => (env.IMAGE_PROVIDER || '').trim().toLowerCase();
+const getImageProvider = (env) => normalizeProvider(env.IMAGE_PROVIDER);
 
 // Use Gemini 3 Pro Image Preview to generate frame-level artwork.
 // referenceImageBase64: base64 string of the first shot image (for character consistency)
@@ -164,7 +162,7 @@ exports.generateImage = async (prompt, previousStyleHint = "", styleOverride, re
   // is configured; otherwise the Gemini path below is used.
   const provider = getImageProvider(env);
 
-  if (provider === 'grok' || provider === 'xai') {
+  if (provider === 'grok') {
     if (!grokClient.hasApiKey(env)) {
       console.log('No valid XAI_API_KEY found. Using placeholder image.');
       return placeholderImage(prompt);
@@ -180,7 +178,7 @@ exports.generateImage = async (prompt, previousStyleHint = "", styleOverride, re
     }
   }
 
-  if (provider === 'grok-cli' || provider === 'grok_cli') {
+  if (provider === 'grok-cli') {
     if (!grokCliService.isAvailable(env)) {
       console.log('Grok Build CLI not found. Using placeholder image.');
       return placeholderImage(prompt);

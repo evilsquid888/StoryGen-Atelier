@@ -8,6 +8,7 @@ const { analyzeShotTransition } = require('./llmService');
 const { GoogleAuth } = require('google-auth-library');
 const grokVideoService = require('./grokVideoService');
 const grokCliService = require('./grokCliService');
+const { normalizeProvider } = require('./providers');
 const videoLogStore = require('./videoLogStore');
 
 const dataDir = path.join(__dirname, '../../data');
@@ -419,7 +420,14 @@ const generateClipWithGrok = async ({ prompt, firstFrame, lastFrame, durationSec
 const generateClipWithGrokCli = async ({ prompt, firstFrame, lastFrame, durationSeconds }) => {
   const sourcePath = await grokCliService.generateVideo({ prompt, firstFrame, lastFrame, durationSeconds });
   const outPath = path.join(videoDir, `clip_grokcli_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp4`);
-  await fs.promises.copyFile(sourcePath, outPath);
+  // Move rather than copy so the Grok session folder does not keep a second
+  // full-size clip; fall back to copy+unlink across filesystems.
+  try {
+    await fs.promises.rename(sourcePath, outPath);
+  } catch (_) {
+    await fs.promises.copyFile(sourcePath, outPath);
+    await fs.promises.unlink(sourcePath).catch(() => {});
+  }
   return { video_path: outPath, provider: 'grok-cli' };
 };
 
@@ -430,14 +438,14 @@ const generateClipDirectly = async (params) => {
     const firstFrame = await readImageBytes(params.first_frame_url);
     const lastFrame = await readImageBytes(params.last_frame_url);
 
-    const provider = (process.env.VIDEO_PROVIDER || '').trim().toLowerCase();
+    const provider = normalizeProvider(process.env.VIDEO_PROVIDER);
 
-    if (provider === 'grok' || provider === 'xai') {
+    if (provider === 'grok') {
       return await generateClipWithGrok({
         prompt: params.prompt, firstFrame, lastFrame, durationSeconds: params.duration_seconds,
       });
     }
-    if (provider === 'grok-cli' || provider === 'grok_cli') {
+    if (provider === 'grok-cli') {
       return await generateClipWithGrokCli({
         prompt: params.prompt, firstFrame, lastFrame, durationSeconds: params.duration_seconds,
       });
