@@ -151,20 +151,40 @@ const toAcpBlocks = (promptParts) => promptParts.map((part) => {
 
 // The headless `text` field concatenates every assistant message of the run,
 // so a tool-using turn can prepend narration ("I'll read both frames first")
-// to the JSON answer. Return the outermost JSON value when one is embedded.
+// to the JSON answer. Return the longest embedded JSON value, so an object is
+// not mistaken for its inner array and bracketed narration ("[image 1]") is skipped.
+const matchBracket = (s, start) => {
+  let depth = 0;
+  let inString = false;
+  for (let i = start; i < s.length; i += 1) {
+    const c = s[i];
+    if (inString) {
+      if (c === '\\') i += 1;
+      else if (c === '"') inString = false;
+    } else if (c === '"') inString = true;
+    else if (c === '[' || c === '{') depth += 1;
+    else if ((c === ']' || c === '}') && --depth === 0) return i;
+  }
+  return -1;
+};
+
 const stripToJson = (text) => {
   const trimmed = String(text || '').trim();
   try { JSON.parse(trimmed); return trimmed; } catch (_) { /* fall through */ }
   const cleaned = trimmed.replace(/```json/gi, '').replace(/```/g, '');
-  for (const [open, close] of [['[', ']'], ['{', '}']]) {
-    const start = cleaned.indexOf(open);
-    const end = cleaned.lastIndexOf(close);
-    if (start !== -1 && end > start) {
-      const candidate = cleaned.slice(start, end + 1);
-      try { JSON.parse(candidate); return candidate; } catch (_) { /* try next */ }
-    }
+  let best = null;
+  for (let start = 0; start < cleaned.length; start += 1) {
+    if (cleaned[start] !== '[' && cleaned[start] !== '{') continue;
+    const end = matchBracket(cleaned, start);
+    if (end === -1) continue;
+    const candidate = cleaned.slice(start, end + 1);
+    try {
+      JSON.parse(candidate);
+      if (!best || candidate.length > best.length) best = candidate;
+      start = end; // values nested inside this one are shorter
+    } catch (_) { /* not JSON; try the next bracket */ }
   }
-  return trimmed;
+  return best || trimmed;
 };
 
 // Build a plain-text prompt: text parts verbatim, image parts saved to disk

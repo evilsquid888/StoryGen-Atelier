@@ -199,3 +199,16 @@ test('reports spawn failures and timeouts with their cause', async () => {
     /failed to run: killed by SIGTERM/
   );
 });
+
+test('stripToJson extracts the outermost JSON value from narrated output', () => {
+  const { stripToJson } = cli._internal;
+  const obj = '{"shots":[{"id":1},{"id":2}]}';
+  assert.equal(stripToJson(obj), obj);
+  assert.equal(stripToJson(`I'll read both frames first.\n${obj}`), obj);
+  assert.equal(stripToJson('```json\n' + obj + '\n```'), obj);
+  const arr = '[{"id":1},{"id":2}]';
+  assert.equal(stripToJson(`Read [image 1] and [image 2].\n${arr}`), arr);
+  assert.equal(stripToJson(`See note [1].\n${arr}\nDone [ok].`), arr);
+  assert.equal(stripToJson('{"prompt":"pan [left] to {right}"}'), '{"prompt":"pan [left] to {right}"}');
+  assert.equal(stripToJson('no json here'), 'no json here');
+});
